@@ -65,7 +65,172 @@ The function receives the current form state and returns the complete render mod
 
 React does not own business logic. React owns rendering, input ergonomics, accessibility, styling, and interaction quality.
 
-## 3. Goals
+## 3. Comparison With JSON Schema Driven Forms
+
+JSON Schema driven forms are the common approach for dynamic forms. The backend returns a declarative schema, and the frontend uses a renderer such as RJSF or a custom component registry to build the UI.
+
+That approach is excellent when the form is mostly structural:
+
+- field names
+- field types
+- required fields
+- primitive validation
+- nested object/array shape
+- enum options
+- simple defaults
+
+Executable forms target a different pain point: forms where the hard part is not shape, but behavior.
+
+### High-Level Difference
+
+| Dimension | JSON Schema Driven Form | Executable Form |
+| --- | --- | --- |
+| Primary abstraction | Data schema/config | Function evaluation |
+| Backend output | Static or semi-static schema | Current render model for current state |
+| Business logic | Encoded as schema keywords, custom DSL, or frontend callbacks | Written directly in Python |
+| Conditional visibility | Usually custom `uiSchema`, `if/then/else`, or renderer-specific rules | Normal `if` statements |
+| Cross-field validation | Awkward; often needs custom validators | Direct references to any state value |
+| Async dependencies | Usually outside JSON Schema; added through frontend glue | Evaluator emits explicit async requests |
+| Computed fields | Usually custom extension | Direct Python computation |
+| Debugging | Inspect schema plus renderer behavior | Step through a function |
+| Tests | Schema snapshots plus frontend tests | Unit tests against evaluator output |
+| Frontend role | Schema interpreter and behavior coordinator | Generic renderer and host runtime |
+| Best fit | CRUD/forms with predictable shape | Workflow-like enterprise forms with branching rules |
+
+### Typical JSON Schema Flow
+
+```text
+Backend returns schema
+  -> Frontend renderer parses schema
+  -> Frontend applies UI schema/extensions
+  -> Frontend wires custom behavior
+  -> Frontend submits data
+  -> Backend validates again
+```
+
+Example:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "resource_type": {
+      "type": "string",
+      "enum": ["s3_bucket", "security_group", "iam_role"]
+    },
+    "cidr": {
+      "type": "string"
+    }
+  },
+  "required": ["resource_type"]
+}
+```
+
+This describes the data shape well. It does not naturally express:
+
+- show `cidr` only when `resource_type == "security_group"`
+- validate CIDR using real IP parsing
+- reject public SSH/RDP/database ports
+- request AWS regions only when the selected resource needs a region
+- keep a loading state while region metadata is unresolved
+- compute `can_submit` from visible required fields plus async status
+
+Those behaviors normally move into:
+
+- custom JSON Schema keywords
+- `uiSchema`
+- frontend `useEffect`
+- frontend validators
+- a homegrown rule DSL
+- backend revalidation after submit
+
+At that point the "schema driven" form has quietly become a distributed behavior engine.
+
+### Executable Form Flow
+
+```text
+Frontend sends current state
+  -> Backend evaluator runs normal Python
+  -> Backend returns FormOutput
+  -> Frontend renders fields exactly as described
+  -> Frontend resolves emitted async requests generically
+  -> Backend remains source of truth
+```
+
+Example:
+
+```python
+is_security_group = resource_type == "security_group"
+port = state.get("port")
+cidr = state.get("cidr", "")
+
+cidr_errors = validate_cidr(cidr) if is_security_group else []
+if is_security_group and port in DANGEROUS_PUBLIC_PORTS and is_public_cidr(cidr):
+    cidr_errors.append(f"{DANGEROUS_PUBLIC_PORTS[port]} cannot be open to the public internet.")
+
+fields.append(text_field(
+    id="cidr",
+    label="Allowed CIDR",
+    visible=is_security_group,
+    required=is_security_group,
+    value=cidr,
+    errors=cidr_errors,
+))
+```
+
+The dependency chain is not encoded into a separate rule format. It is the execution order of the function:
+
+```text
+read state -> derive facts -> append fields -> collect errors -> return output
+```
+
+### Where JSON Schema Still Wins
+
+JSON Schema is still a good choice when:
+
+- forms closely match API payload shape
+- rules are mostly type/required/min/max/pattern/enum
+- product teams need broad ecosystem compatibility
+- forms are authored by config rather than engineers
+- runtime behavior must be inspectable as static data
+- offline schema validation is enough
+
+For simple forms, executable forms are overkill.
+
+### Where Executable Forms Win
+
+Executable forms are better when:
+
+- business rules are already written or reviewed by backend/domain engineers
+- fields branch into different workflows
+- visibility and validation depend on several other fields
+- async lookups affect later fields
+- computed values need normal programming constructs
+- compliance wants deterministic, testable rules
+- frontend teams should not translate backend rules by hand
+
+The key tradeoff:
+
+```text
+JSON Schema optimizes for portable structure.
+Executable Forms optimize for executable behavior.
+```
+
+### Concrete AWS Compliance Example
+
+The current prototype includes rules that are awkward in plain JSON Schema:
+
+- S3 bucket naming rules using regex plus IP-address rejection.
+- S3 encryption policy changes by check level.
+- Security group port range validation.
+- CIDR parsing through Python's `ipaddress` module.
+- Public internet checks for SSH, RDP, MySQL, PostgreSQL, Redis, and Elasticsearch.
+- IAM role name validation.
+- Dynamic AWS region lookup emitted as an async request.
+
+With JSON Schema, these would likely become a mix of `pattern`, custom validation code, and frontend orchestration. Here they live in one Python evaluator and are covered by pytest.
+
+## 4. Goals
 
 - Let backend/domain engineers author form behavior in Python using normal language control flow.
 - Keep frontend rendering generic and predictable.
@@ -74,7 +239,7 @@ React does not own business logic. React owns rendering, input ergonomics, acces
 - Prove the paradigm over HTTP before investing in WASM.
 - Keep legacy forms isolated instead of forcing backward compatibility into the new model.
 
-## 4. Non-Goals
+## 5. Non-Goals
 
 - Do not build a visual low-code form builder.
 - Do not replace TanStack Form immediately.
@@ -83,7 +248,7 @@ React does not own business logic. React owns rendering, input ergonomics, acces
 - Do not expose arbitrary Python execution from user-authored input.
 - Do not attempt full offline support until the runtime model is proven.
 
-## 5. Core Architecture
+## 6. Core Architecture
 
 ```text
 Browser
@@ -121,7 +286,7 @@ Future runtime:
 User input -> React state -> local WASM evaluate -> FormOutput -> React render
 ```
 
-## 6. Form Contract
+## 7. Form Contract
 
 ### Evaluation Input
 
@@ -171,7 +336,7 @@ User input -> React state -> local WASM evaluate -> FormOutput -> React render
 }
 ```
 
-## 7. Python Authoring Model
+## 8. Python Authoring Model
 
 The backend author writes ordinary Python. Execution order is the dependency model.
 
@@ -266,7 +431,7 @@ def evaluate(state: dict, context: dict, async_results: dict) -> dict:
     }
 ```
 
-## 8. Async Boundary
+## 9. Async Boundary
 
 WASM and pure evaluators should not perform network calls directly. Async is modeled as a host interaction:
 
@@ -291,7 +456,7 @@ Example:
 
 This keeps form evaluation deterministic and testable.
 
-## 9. Frontend FormRunner
+## 10. Frontend FormRunner
 
 Frontend responsibilities:
 
@@ -318,7 +483,7 @@ const FIELD_COMPONENTS = {
 
 TanStack Form can remain the local input/state layer. It should not encode domain rules.
 
-## 10. API Design
+## 11. API Design
 
 ```http
 POST /forms/{form_id}/evaluate
@@ -356,7 +521,7 @@ def evaluate_form(form_id: str, request: EvaluationRequest) -> FormOutput:
     return evaluator(request.state, request.context, request.async_results)
 ```
 
-## 11. Legacy Strategy
+## 12. Legacy Strategy
 
 Legacy forms should not shape the new abstraction.
 
@@ -368,7 +533,7 @@ Legacy forms should not shape the new abstraction.
 
 This is a strangler pattern, not a big-bang rewrite.
 
-## 12. Runtime Roadmap
+## 13. Runtime Roadmap
 
 ### Milestone 1: HTTP Prototype
 
@@ -429,7 +594,7 @@ Purpose: decide whether this becomes a broader platform primitive.
 - Define runtime package boundaries.
 - Explore React/Vue/Angular adapters only after React implementation works.
 
-## 13. Key Risks
+## 14. Key Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
@@ -441,7 +606,7 @@ Purpose: decide whether this becomes a broader platform primitive.
 | Business logic exposed client-side | Compliance concern | Do not claim WASM is secure obfuscation; use server runtime for sensitive rules |
 | Legacy migration expands scope | Project stalls | Use strangler migration triggers |
 
-## 14. Security Notes
+## 15. Security Notes
 
 WASM is not a security boundary. Client-side logic can be inspected, copied, and manipulated.
 
@@ -452,7 +617,7 @@ Sensitive eligibility rules, pricing rules, fraud checks, and entitlement checks
 - stay server-side, or
 - run client-side only as previews and be revalidated on submit.
 
-## 15. Testing Strategy
+## 16. Testing Strategy
 
 Evaluator tests:
 
@@ -477,7 +642,7 @@ Frontend tests:
 - Ignores stale evaluate responses.
 - Executes async request once per stable key.
 
-## 16. First Prototype Task List
+## 17. First Prototype Task List
 
 1. Create `form_engine/aws_compliance.py`.
 2. Define simple field helper functions.
@@ -496,7 +661,7 @@ Frontend tests:
 15. Add pytest coverage for evaluator output.
 16. Record whether the authoring model feels better than React logic.
 
-## 17. Prototype Decisions
+## 18. Prototype Decisions
 
 | Question | Decision |
 | --- | --- |
@@ -508,7 +673,7 @@ Frontend tests:
 | Client-side-safe WASM rules | TODO |
 | TanStack Query integration | Try it if it keeps async request handling simpler |
 
-## 18. Recommended Starting Point
+## 19. Recommended Starting Point
 
 Start with the HTTP prototype. Do not start with WASM.
 
